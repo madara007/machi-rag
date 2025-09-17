@@ -6,20 +6,17 @@ import pandas as pd
 from dotenv import load_dotenv
 from janome.tokenizer import Tokenizer
 from rank_bm25 import BM25Okapi
-
+import openai
 import faiss
-from langchain_openai import AzureOpenAIEmbeddings
 
 # =========================================================
 # 環境変数の読み込み
 # =========================================================
 load_dotenv()
 
-# Azure OpenAI (Embeddings) 設定
-OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
-AZURE_EMBED_DEPLOYMENT = os.getenv("AZURE_EMBED_DEPLOYMENT", "embedding-model-us")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+# OpenAI 設定
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
 
 # デフォルトの保存先
 DEFAULT_FAISS_PATH = "faiss.index"
@@ -35,29 +32,36 @@ def l2_normalize(x: np.ndarray, axis: int = 1, eps: float = 1e-12) -> np.ndarray
 class HybridSearchEngine:
   """
   FAISS（コサイン類似/IndexFlatIP）と BM25 を加重合成するハイブリッド検索。
-  - ベクトル: AzureOpenAIEmbeddings を使用（手動でL2正規化）
-  - BM25: Janomeで日本語トークナイズ（名詞・動詞・形容詞中心）
+  - ベクトル: OpenAI Embeddings を使用（手動でL2正規化）
+  - BM25: Janomeで日本語トークナイズ
   - 保存: FAISSインデックス＋texts.jsonl を保存して再ロード時のズレを回避
   """
 
-  def __init__(
-    self,
-    azure_embed_deployment: str = AZURE_EMBED_DEPLOYMENT,
-    openai_api_version: str = OPENAI_API_VERSION,
-    azure_api_key: Optional[str] = AZURE_OPENAI_API_KEY,
-    azure_endpoint: Optional[str] = AZURE_OPENAI_ENDPOINT,
-  ) -> None:
+  def __init__(self) -> None:
     self.texts: List[str] = []
-    self.embedding_model = AzureOpenAIEmbeddings(
-      azure_deployment=azure_embed_deployment,
-      openai_api_version=openai_api_version,
-      openai_api_key=azure_api_key,
-      azure_endpoint=azure_endpoint,
-    )
     self.tokenizer = Tokenizer()
     self.bm25: Optional[BM25Okapi] = None
     self.index: Optional[faiss.IndexFlatIP] = None
-    self.embedding_dim: int = 0
+    self.embedding_dim: int = 1536  # text-embedding-3-small の次元数
+
+  # -------------------- Embedding --------------------
+
+  def get_embeddings(self, texts: List[str]) -> np.ndarray:
+    """複数テキストの埋め込み取得"""
+    resp = openai.embeddings.create(
+      model="text-embedding-3-small",
+      input=texts
+    )
+    emb = np.array([d.embedding for d in resp.data], dtype="float32")
+    return emb
+
+  def get_query_embedding(self, query: str) -> np.ndarray:
+    """単一クエリの埋め込み取得"""
+    resp = openai.embeddings.create(
+      model="text-embedding-3-small",
+      input=[query]
+    )
+    return np.array(resp.data[0].embedding, dtype="float32")
 
   # -------------------- Ingest / Build --------------------
 
@@ -70,10 +74,6 @@ class HybridSearchEngine:
     max_rows: Optional[int] = None,
     texts_out_path: str = DEFAULT_TEXTS_PATH,
   ) -> None:
-    """
-    Excelから読み込んでフィルタし、インデックスを構築。
-    使ったテキストは texts.jsonl に保存して、再ロード時のズレを防ぐ。
-    """
     df = pd.read_excel(excel_path, nrows=max_rows) if max_rows else pd.read_excel(excel_path)
     if score_column in df.columns:
       df = df[df[score_column] > threshold]
@@ -85,23 +85,17 @@ class HybridSearchEngine:
     self.save_texts(texts_out_path)
 
   def build_index(self, texts: List[str]) -> None:
-    """
-    与えられたテキストから BM25 と FAISS(IP=コサイン類似) を構築。
-    """
     if not texts:
       raise ValueError("空のテキストリストです。")
     self.texts = texts
 
-    # --- 埋め込み作成（L2正規化でコサイン類似に） ---
-    embeddings = self.embedding_model.embed_documents(texts)  # List[List[float]]
-    emb = np.asarray(embeddings, dtype="float32")
-    emb = l2_normalize(emb, axis=1)
+    embeddings = self.get_embeddings(texts)
+    emb = l2_normalize(embeddings, axis=1)
 
     self.embedding_dim = emb.shape[1]
-    self.index = faiss.IndexFlatIP(self.embedding_dim)  # 内積 = コサイン類似（正規化済み）
+    self.index = faiss.IndexFlatIP(self.embedding_dim)
     self.index.add(emb)
 
-    # --- BM25 構築 ---
     tokenized_corpus = [self._tokenize_ja(t) for t in texts]
     self.bm25 = BM25Okapi(tokenized_corpus)
 
@@ -117,7 +111,6 @@ class HybridSearchEngine:
       raise ValueError("保存するテキストがありません。")
     with open(texts_path, "w", encoding="utf-8") as f:
       for t in self.texts:
-        # 1行1文書。改行はスペースに。
         f.write(t.replace("\n", " ") + "\n")
 
   def load_index(self, faiss_path: str = DEFAULT_FAISS_PATH, texts_path: str = DEFAULT_TEXTS_PATH) -> None:
@@ -135,15 +128,12 @@ class HybridSearchEngine:
     tokenized = [self._tokenize_ja(t) for t in self.texts]
     self.bm25 = BM25Okapi(tokenized)
 
-  # -------------------- Search (Vector / BM25 / Hybrid) --------------------
+  # -------------------- Search --------------------
 
   def search_by_vector(self, query: str, k: int = 5) -> List[Tuple[int, float]]:
-    """
-    コサイン類似（大きいほど良い）。(idx, sim) を上位k件返す。
-    """
     if self.index is None:
       raise ValueError("FAISS インデックスが未構築です。")
-    q = np.asarray(self.embedding_model.embed_query(query), dtype="float32")[None, :]
+    q = self.get_query_embedding(query)[None, :]
     q = l2_normalize(q, axis=1)
     k = min(k, self.index.ntotal)
     sims, ids = self.index.search(q, k)
@@ -155,15 +145,11 @@ class HybridSearchEngine:
     return out
 
   def search_by_bm25(self, query: str, k: int = 5) -> List[Tuple[int, float]]:
-    """
-    BM25で (idx, score) 上位k件。
-    """
     if self.bm25 is None:
       raise ValueError("BM25 が未構築です。")
     query_tokens = self._tokenize_ja(query)
     scores = self.bm25.get_scores(query_tokens)
     ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:k]
-    # List[(idx, score)]
     return [(int(i), float(s)) for i, s in ranked]
 
   def search_hybrid(
@@ -176,11 +162,6 @@ class HybridSearchEngine:
     top_k_bm25: int = 200,
     return_with_scores: bool = False,
   ) -> List[str] | List[Tuple[str, float]]:
-    """
-    ベクトルTopKとBM25TopKの和集合に対して、min-max正規化→加重合成。
-    返り値: テキスト上位k件（return_with_scores=Trueなら (text, score)）
-    """
-    # 個別TopKを広めに取り、全件探索を避ける
     vec_hits = self.search_by_vector(query, k=min(top_k_vec, max(1, len(self.texts))))
     bm_hits = self.search_by_bm25(query,  k=min(top_k_bm25, max(1, len(self.texts))))
 
@@ -205,7 +186,6 @@ class HybridSearchEngine:
   # -------------------- Utils --------------------
 
   def _normalize_scores(self, scores: Dict[int, float]) -> Dict[int, float]:
-    """min-max正規化（値が一定なら1.0に）。"""
     if not scores:
       return {}
     vals = list(scores.values())
@@ -215,13 +195,6 @@ class HybridSearchEngine:
     return {i: (v - mn) / (mx - mn) for i, v in scores.items()}
 
   def _tokenize_ja(self, text: str) -> List[str]:
-    """
-    日本語BM25向けトークナイズ：
-    - 品詞: 名詞/動詞/形容詞
-    - 動詞・形容詞は基本形
-    - 2文字未満や空白類、記号は除去
-    - 英数は小文字化
-    """
     toks: List[str] = []
     for t in self.tokenizer.tokenize(text):
       pos = t.part_of_speech.split(",")[0]
@@ -231,12 +204,10 @@ class HybridSearchEngine:
       w = base.strip().lower()
       if not w or len(w) < 2:
         continue
-      # 簡易な記号除去
       if all(ch in ".,:;!?()[]{}<>\"'`~|\\/+-=_*^%$#@＆※・、。　 " for ch in w):
         continue
       toks.append(w)
     return toks
-
 
 # -------------------- サンプル実行 --------------------
 if __name__ == "__main__":
