@@ -333,12 +333,6 @@ function Composer({
           <Send className="mr-1 h-4 w-4" /> 送信
         </Button>
       </div>
-      <div className="mt-1 flex items-center justify-between px-1 text-xs text-muted-foreground">
-        <div className="flex items-center gap-1">
-          <Smile className="h-3.5 w-3.5" />
-          <span>Shift+Enterで改行</span>
-        </div>
-      </div>
     </div>
   );
 }
