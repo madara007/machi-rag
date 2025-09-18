@@ -1,254 +1,122 @@
 import os
-from typing import List, Tuple, Optional, Dict
-
+import json
+import faiss
 import numpy as np
+import openai
 import pandas as pd
+from dataclasses import dataclass
 from dotenv import load_dotenv
 from janome.tokenizer import Tokenizer
 from rank_bm25 import BM25Okapi
-import openai
-import faiss
 
-# =========================================================
-# 環境変数の読み込み
-# =========================================================
-load_dotenv()
+from pypdf  import PdfReader
+from sentence_transformers import SentenceTransformer
 
-# OpenAI 設定
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
-
-# デフォルトの保存先
-DEFAULT_FAISS_PATH = "faiss.index"
-DEFAULT_TEXTS_PATH = "texts.jsonl"
+"""
+FAISS（コサイン類似/IndexFlatIP）と BM25 を加重合成するハイブリッド検索。
+- ベクトル: hugging face  Embeddings を使用
+- BM25: Janomeで日本語トークナイズ
+- 保存: FAISSインデックス＋texts.jsonl を保存して再ロード時のズレを回避
+- intfloat/multilingual-e5-base → 768次元
+"""
 
 
-def l2_normalize(x: np.ndarray, axis: int = 1, eps: float = 1e-12) -> np.ndarray:
-  """行ベクトルごとにL2正規化。"""
-  norm = np.linalg.norm(x, axis=axis, keepdims=True) + eps
-  return x / norm
+
+model_name = "intfloat/multilingual-e5-base"
+model_path = f"path_to_model/{model_name}"
+model = SentenceTransformer(model_path)
+
+text  = ["ベクトル化したい文字列", "hogehoge"]
+
+embedding = model.encode(text)
+
+# --------------------------------------------------
+# 2. FAISS インデックス作成（L2距離を使用）
+#L2(ユークリッド距離)ベクトル次元の二乗の値を合計した平方根を求めるため長さを渡してる。
+# np.array　shape 次元数の取得
+"""
+np.array
+ValueError: not enough values to unpack (expected 2, got 1)
+理由: arr.shape は (3,)（一次元）なので、2つの値（rows, cols）に分けられない。
+二次元配列にしないとfaissに登録できない
+atleast_2dを利用すると二次元配列の計算をしてくれるようになる
+"""
+#FAIssにベクトルを登録するさいに次元数インスタンスの引数に果たさないといけない。
+_, d  = np.array(embedding).astype("float32").shape
+index = faiss.IndexFlatL2(d)
+
+index.add(np.array(embedding).astype('float32'))
+
+# --------------------------------------------------
+# 3. 日本語トークン化（Janome
+tokenizer = Tokenizer()
+
+tokenized_texts = [
+  [token.surface for token in tokenizer.tokenize(t)]
+  for t in text
+]
+
+#----------------------------------------------------
+#Okapi Bm25 情報検索
+#各文章においてその単語がどのくらい出現したのかを計算する
+"""
+BM25 のスコアは コーパス（文書）の単語の出方 と クエリ（検索語）の単語 の関係で決まります。
+ただし「文字数」そのものではなく、単語数や単語の出現頻度と文書全体の長さが関係してきます。
+"""
+bm25 = BM25Okapi(tokenized_texts)
+
+# 検索クエリの設定とトークン化
+query_text = "テスト ベクトル"
+tokenized_query = [token.surface for token in tokenizer.tokenize(query_text)]
 
 
-class HybridSearchEngine:
-  """
-  FAISS（コサイン類似/IndexFlatIP）と BM25 を加重合成するハイブリッド検索。
-  - ベクトル: OpenAI Embeddings を使用（手動でL2正規化）
-  - BM25: Janomeで日本語トークナイズ
-  - 保存: FAISSインデックス＋texts.jsonl を保存して再ロード時のズレを回避
-  """
+# --------------------------------------------------
+# 4. ベクトル検索（クエリをベクトル化し、FAISS で検索）
+query_embedding = model.encode(query_text)
+query_vector = np.array(query_embedding).astype('float32').reshape(1, -1)
+"""
+クエリベクトルとコーパス内の全ベクトルの距離を計算
 
-  def __init__(self) -> None:
-    self.texts: List[str] = []
-    self.tokenizer = Tokenizer()
-    self.bm25: Optional[BM25Okapi] = None
-    self.index: Optional[faiss.IndexFlatIP] = None
-    self.embedding_dim: int = 1536  # text-embedding-3-small の次元数
+距離が小さい順（または類似度が大きい順）に上位k件を返す
 
-  # -------------------- Embedding --------------------
+D = 距離のリスト, I = 文書番号のリスト
+"""
+D, I = index.search(query_vector, k=min(10, index.ntotal))
 
-  def get_embeddings(self, texts: List[str]) -> np.ndarray:
-    """複数テキストの埋め込み取得"""
-    resp = openai.embeddings.create(
-      model="text-embedding-3-small",
-      input=texts
-    )
-    emb = np.array([d.embedding for d in resp.data], dtype="float32")
-    return emb
+print("\n=== ベクトル検索結果 ===")
+for rank, idx in enumerate(I[0],  start=1):
+  print(f"順位 {rank}: テキスト='{text[idx]}', 距離={D[0][rank-1]:.4f}")
 
-  def get_query_embedding(self, query: str) -> np.ndarray:
-    """単一クエリの埋め込み取得"""
-    resp = openai.embeddings.create(
-      model="text-embedding-3-small",
-      input=[query]
-    )
-    return np.array(resp.data[0].embedding, dtype="float32")
 
-  # -------------------- Ingest / Build --------------------
+# --------------------------------------------------
+# 5. キーワード検索（BM25）
+print("\n=== キーワード検索（BM25）結果 ===")
+bm25_scores = bm25.get_scores(tokenized_query)
+indexed_scores = list(enumerate(bm25_scores))
+indexed_scores.sort(key=lambda x: x[1], reverse=True)
 
-  def build_index_from_excel(
-    self,
-    excel_path: str,
-    text_column: str = "question",
-    score_column: str = "総合評価",
-    threshold: int = 20,
-    max_rows: Optional[int] = None,
-    texts_out_path: str = DEFAULT_TEXTS_PATH,
-  ) -> None:
-    df = pd.read_excel(excel_path, nrows=max_rows) if max_rows else pd.read_excel(excel_path)
-    if score_column in df.columns:
-      df = df[df[score_column] > threshold]
-    if text_column not in df.columns:
-      raise ValueError(f"{text_column} 列が見つかりません")
+print(indexed_scores)
 
-    texts = df[text_column].astype(str).tolist()
-    self.build_index(texts)
-    self.save_texts(texts_out_path)
+for rank, (idx, score) in enumerate(indexed_scores[:10], start=1):
+  print(f"順位 {rank}: テキスト='{text[idx]}', BM25スコア={score:.4f}")
 
-  def build_index(self, texts: List[str]) -> None:
-    if not texts:
-      raise ValueError("空のテキストリストです。")
-    self.texts = texts
+# --------------------------------------------------
+# 6. ハイブリッド検索（ベクトル + BM25 を統合）
+print("\n=== ハイブリッド検索結果 ===")
+hybrid_scores = []
+for pos, idx in enumerate(I[0]):
+  # ベクトルスコア（距離の逆数でスコア化）
+  vec_score = 1 / (D[0][pos] + 1e-5)
+  # BM25スコア（事前に算出済み）
+  bm25_score = bm25_scores[idx]
+  # ハイブリッドスコア（加重平均：ここでは 0.5:0.5）
+  hybrid_score = 0.5 * vec_score + 0.5 * bm25_score
+  hybrid_scores.append((idx, hybrid_score, D[0][pos], bm25_score))
 
-    embeddings = self.get_embeddings(texts)
-    emb = l2_normalize(embeddings, axis=1)
-
-    self.embedding_dim = emb.shape[1]
-    self.index = faiss.IndexFlatIP(self.embedding_dim)
-    self.index.add(emb)
-
-    tokenized_corpus = [self._tokenize_ja(t) for t in texts]
-    self.bm25 = BM25Okapi(tokenized_corpus)
-
-  # -------------------- Save / Load --------------------
-
-  def save_index(self, faiss_path: str = DEFAULT_FAISS_PATH) -> None:
-    if self.index is None:
-      raise ValueError("FAISS インデックスが未構築です。")
-    faiss.write_index(self.index, faiss_path)
-
-  def save_texts(self, texts_path: str = DEFAULT_TEXTS_PATH) -> None:
-    if not self.texts:
-      raise ValueError("保存するテキストがありません。")
-    with open(texts_path, "w", encoding="utf-8") as f:
-      for t in self.texts:
-        f.write(t.replace("\n", " ") + "\n")
-
-  def load_index(self, faiss_path: str = DEFAULT_FAISS_PATH, texts_path: str = DEFAULT_TEXTS_PATH) -> None:
-    if not os.path.exists(faiss_path):
-      raise FileNotFoundError(f"インデックスファイルが見つかりません: {faiss_path}")
-    if not os.path.exists(texts_path):
-      raise FileNotFoundError(f"textsファイルが見つかりません: {texts_path}")
-
-    self.index = faiss.read_index(faiss_path)
-    self.embedding_dim = self.index.d
-
-    with open(texts_path, "r", encoding="utf-8") as f:
-      self.texts = [ln.rstrip("\n") for ln in f]
-
-    tokenized = [self._tokenize_ja(t) for t in self.texts]
-    self.bm25 = BM25Okapi(tokenized)
-
-  # -------------------- Search --------------------
-
-  def search_by_vector(self, query: str, k: int = 5) -> List[Tuple[int, float]]:
-    if self.index is None:
-      raise ValueError("FAISS インデックスが未構築です。")
-    q = self.get_query_embedding(query)[None, :]
-    q = l2_normalize(q, axis=1)
-    k = min(k, self.index.ntotal)
-    sims, ids = self.index.search(q, k)
-    out: List[Tuple[int, float]] = []
-    for i, sim in zip(ids[0], sims[0]):
-      if i == -1:
-        continue
-      out.append((int(i), float(sim)))
-    return out
-
-  def search_by_bm25(self, query: str, k: int = 5) -> List[Tuple[int, float]]:
-    if self.bm25 is None:
-      raise ValueError("BM25 が未構築です。")
-    query_tokens = self._tokenize_ja(query)
-    scores = self.bm25.get_scores(query_tokens)
-    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:k]
-    return [(int(i), float(s)) for i, s in ranked]
-
-  def search_hybrid(
-    self,
-    query: str,
-    k: int = 5,
-    vec_weight: float = 0.5,
-    bm25_weight: float = 0.5,
-    top_k_vec: int = 100,
-    top_k_bm25: int = 200,
-    return_with_scores: bool = False,
-  ) -> List[str] | List[Tuple[str, float]]:
-    vec_hits = self.search_by_vector(query, k=min(top_k_vec, max(1, len(self.texts))))
-    bm_hits = self.search_by_bm25(query,  k=min(top_k_bm25, max(1, len(self.texts))))
-
-    vec_scores_raw: Dict[int, float] = {i: s for i, s in vec_hits}
-    bm_scores_raw:  Dict[int, float] = {i: s for i, s in bm_hits}
-
-    vec_scores = self._normalize_scores(vec_scores_raw)
-    bm_scores  = self._normalize_scores(bm_scores_raw)
-
-    all_ids = set(vec_scores) | set(bm_scores)
-    combo: List[Tuple[int, float]] = []
-    for i in all_ids:
-      score = vec_weight * vec_scores.get(i, 0.0) + bm25_weight * bm_scores.get(i, 0.0)
-      combo.append((i, score))
-    combo.sort(key=lambda x: x[1], reverse=True)
-    top = combo[:k]
-
-    if return_with_scores:
-      return [(self.texts[i], float(s)) for i, s in top]
-    return [self.texts[i] for i, _ in top]
-
-  # -------------------- Utils --------------------
-
-  def _normalize_scores(self, scores: Dict[int, float]) -> Dict[int, float]:
-    if not scores:
-      return {}
-    vals = list(scores.values())
-    mn, mx = min(vals), max(vals)
-    if mx == mn:
-      return {i: 1.0 for i in scores}
-    return {i: (v - mn) / (mx - mn) for i, v in scores.items()}
-
-  def _tokenize_ja(self, text: str) -> List[str]:
-    toks: List[str] = []
-    for t in self.tokenizer.tokenize(text):
-      pos = t.part_of_speech.split(",")[0]
-      if pos not in ("名詞", "動詞", "形容詞"):
-        continue
-      base = t.base_form if t.base_form and t.base_form != "*" else t.surface
-      w = base.strip().lower()
-      if not w or len(w) < 2:
-        continue
-      if all(ch in ".,:;!?()[]{}<>\"'`~|\\/+-=_*^%$#@＆※・、。　 " for ch in w):
-        continue
-      toks.append(w)
-    return toks
-
-# -------------------- サンプル実行 --------------------
-if __name__ == "__main__":
-  """
-  最小デモ:
-  - 初回: Excelからフィルタ→インデックス構築→保存
-  - 2回目以降: 保存物をロードして検索
-  """
-  excel_file = "QA抽出_大学メール_2025.4.21.xlsx"  # 置き換えてください
-  text_col = "question"
-  score_col = "総合評価"
-  threshold = 20
-  query_text = "講演会の申し込みページを作りたい。必要な項目を教えて"
-  faiss_file = DEFAULT_FAISS_PATH
-  texts_file = DEFAULT_TEXTS_PATH
-
-  engine = HybridSearchEngine()
-
-  if not (os.path.exists(faiss_file) and os.path.exists(texts_file)):
-    print("[INFO] Excel から読み込み、インデックスを構築中...")
-    engine.build_index_from_excel(
-      excel_path=excel_file,
-      text_column=text_col,
-      score_column=score_col,
-      threshold=threshold,
-      texts_out_path=texts_file,
-    )
-    engine.save_index(faiss_file)
-  else:
-    print("[INFO] 保存済みインデックスを読み込み中...")
-    engine.load_index(faiss_file, texts_file)
-
-  print("[INFO] ハイブリッド検索…")
-  results = engine.search_hybrid(
-    query=query_text,
-    k=10,
-    vec_weight=0.5,
-    bm25_weight=0.5,
-    top_k_vec=100,
-    top_k_bm25=200,
-    return_with_scores=True,
+# スコア順に並べ替え
+hybrid_scores.sort(key=lambda x: x[1], reverse=True)
+for rank, (idx, score, dist, bm) in enumerate(hybrid_scores, start=1):
+  print(
+    f"順位 {rank}: テキスト='{text[idx]}', "
+    f"ハイブリッドスコア={score:.4f} (距離={dist:.4f}, BM25スコア={bm:.4f})"
   )
-  for i, (text, score) in enumerate(results, 1):
-    print(f"{i:02d}. {score:.3f} | {text[:100]}{'…' if len(text) > 100 else ''}")
